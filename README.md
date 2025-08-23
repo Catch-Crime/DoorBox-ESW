@@ -23,13 +23,52 @@ DoorBox is an intelligent door monitoring system that performs real-time face an
 - **Cloud Storage**: AWS S3 with boto3
 - **Communication**: Serial (UART), RTSP streaming
 
+## Data Structure
+
+### S3 Bucket Organization
+```
+doorbox-data (버킷명)
+└── home-1/
+    └── cam-1/
+        └── 2025/
+            └── 08/
+                ├── 23/
+                │   ├── 20250823_214006_log/
+                │   │   ├── 20250823_214006_frame.jpg (원본 프레임)
+                │   │   ├── 20250823_214006_clip.mp4 (5초 영상 클립)
+                │   │   └── 20250823_214006_result.json (분류 결과)
+                │   ├── 20250823_220145_log/
+                │   └── ...
+                ├── 24/
+                │   ├── 20250824_093022_log/
+                │   └── ...
+                └── 25/
+                    └── 20250825_105423_log/
+                        └── ...
+```
+
+### JSON Output Format
+```json
+{
+  "day": "20250823",
+  "time": "21:40:06", 
+  "image_key": "doorbox-data/home-1/cam-1/2025/08/23/20250823_214006_log/20250823_214006_frame.jpg",
+  "detection_results": {
+    "accessory": true,
+    "emotion": "alert",
+    "gender": "male",     // 0=male, 1=female
+    "age_group": "20s"    // 0s, 10s, 20s, ..., 70s, over80s
+  }
+}
+```
+
 ## Features
 
 ### Multi-Modal Classification
-- **Emotion Detection**: Binary classification (negative/non-negative)
-- **Mask Detection**: Presence/absence with confidence threshold
+- **Emotion Detection**: Binary classification (Alert / non-Alert)
+- **Acc Detection**: Binary classification (true / false)
 - **Gender Classification**: Male/female identification
-- **Age Estimation**: 9-class age group prediction (0-9, 10-19, ..., 80+)
+- **Age Estimation**: 9-class age group prediction (0s, 10s, ..., over80s)
 
 ### Smart Detection Logic
 - **Conditional Processing**: Mask detection runs first; if mask detected, other classifications are skipped
@@ -46,8 +85,8 @@ DoorBox is an intelligent door monitoring system that performs real-time face an
 
 | Component | Model | Purpose | Classes |
 |-----------|-------|---------|---------|
-| Emotion | EfficientNet-B0 | Sentiment analysis | 2 (negative, non-negative) |
-| Accessory | GhostNet | Mask detection | 2 (with/without mask) |
+| Emotion | EfficientNet-B0 | Sentiment analysis | 2 (alart, non-alart) |
+| Accessory | GhostNet | Mask detection | 2 (with/without Acc) |
 | Gender | MobileNetV3-Small | Gender classification | 2 (male, female) |
 | Age | EfficientNet-B0 | Age group estimation | 9 (decade-based groups) |
 
@@ -129,33 +168,6 @@ DoorBox 시스템 시작됨
 5. **Data Storage**: Results saved locally and queued for S3 upload
 6. **Session Management**: Automatic session termination after timeout
 
-## Data Structure
-
-### S3 Bucket Organization
-```
-doorbox-data/
-├── 2025/08/16/
-│   ├── 20250816_143052_log/
-│   │   ├── 20250816_143052_frame.jpg
-│   │   ├── 20250816_143052_clip.mp4
-│   │   └── 20250816_143052_result.json
-```
-
-### JSON Output Format
-```json
-{
-  "day": "20250816",
-  "time": "14:30:52",
-  "detection_results": {
-    "emotion": "non-negative",
-    "confidence": 0.851,
-    "has_mask": false,
-    "gender": "female",
-    "age_group": "20-29"
-  },
-  "image_key": "doorbox-data/2025/08/16/20250816_143052_log/20250816_143052_frame.jpg"
-}
-```
 
 ## Performance Optimization
 
