@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 from torchvision.models import efficientnet_b0, mobilenet_v3_small
-import timm  # GhostNet을 위해 필요
+import timm
 import serial
 import threading
 import time
@@ -69,6 +69,17 @@ class DoorBoxInferenceSystem:
         self.first_detection_time = None
         self.last_capture_time = None
         self.detection_session_id = None
+        
+        # ★ 캡처 상태 관리 강화
+        self.capture_in_progress = False  # 캡처 진행 중 플래그
+        self.capture_lock = threading.Lock()  # 캡처 동기화용
+        self.last_successful_capture_time = 0  # 마지막 성공한 캡처 시간
+        self.capture_timer = None  # 현재 활성화된 타이머
+        self.pending_captures = 0  # 대기 중인 캡처 수
+        
+        # ★ 파일명 중복 방지를 위한 카운터
+        self.filename_counter = {}  # {base_filename: count}
+        self.filename_lock = threading.Lock()
         
         self.logger.info("DoorBox 추론 시스템 초기화 완료")
     
@@ -524,11 +535,14 @@ class DoorBoxInferenceSystem:
         self.upload_thread.start()
         self.logger.info("S3 업로드 스레드 시작")
     
-    def _queue_upload_data(self, frame_path, video_path, result_data):
+    def _queue_upload_data(self, frame_path, video_path, result_data, capture_timestamp=None):
         """S3 업로드 큐에 데이터 추가"""
-        # 서울 시간대로 타임스탬프 생성
-        seoul_tz = pytz.timezone('Asia/Seoul')
-        timestamp = datetime.now(seoul_tz)
+        # ★ capture_timestamp가 제공되면 사용, 아니면 현재 시간
+        if capture_timestamp is None:
+            seoul_tz = pytz.timezone('Asia/Seoul')
+            timestamp = datetime.now(seoul_tz)
+        else:
+            timestamp = capture_timestamp  # 캡처 시점의 정확한 시간 사용
         
         upload_item = {
             'timestamp': timestamp,
@@ -599,6 +613,43 @@ class DoorBoxInferenceSystem:
         except Exception as e:
             self.logger.error(f"JSON 업로드 실패: {s3_key}, 오류: {e}")
             return False
+    
+    def _generate_unique_filename(self, base_timestamp_str):
+        """중복 방지를 위한 고유 파일명 생성"""
+        with self.filename_lock:
+            if base_timestamp_str in self.filename_counter:
+                self.filename_counter[base_timestamp_str] += 1
+                counter = self.filename_counter[base_timestamp_str]
+                return f"{base_timestamp_str}_{counter:02d}"
+            else:
+                self.filename_counter[base_timestamp_str] = 0
+                return base_timestamp_str
+    
+    def _generate_s3_paths_with_custom_filename(self, timestamp, custom_filename):
+        """커스텀 파일명을 사용한 S3 경로 생성"""
+        # timestamp가 이미 서울 시간대면 그대로, 아니면 변환
+        if timestamp.tzinfo is None or timestamp.tzinfo.utcoffset(timestamp) is None:
+            seoul_tz = pytz.timezone('Asia/Seoul')
+            dt = seoul_tz.localize(timestamp)
+        else:
+            seoul_tz = pytz.timezone('Asia/Seoul')
+            dt = timestamp.astimezone(seoul_tz)
+        
+        # ★ custom_filename 사용
+        folder_name = f"{custom_filename}_log"
+        
+        base_path = f"home-1/cam-1/{dt.year:04d}/{dt.month:02d}/{dt.day:02d}/{folder_name}"
+        
+        # JSON의 image_key는 전체 경로 (doorbox-data 포함)
+        image_key_full_path = f"doorbox-data/home-1/cam-1/{dt.year:04d}/{dt.month:02d}/{dt.day:02d}/{folder_name}/{custom_filename}_frame.jpg"
+        
+        return {
+            'base_path': base_path,
+            'frame_key': f"{base_path}/{custom_filename}_frame.jpg",
+            'video_key': f"{base_path}/{custom_filename}_clip.mp4",
+            'result_key': f"{base_path}/{custom_filename}_result.json",
+            'image_key_full_path': image_key_full_path
+        }
     
     def _process_upload_batch(self):
         """배치 업로드 처리"""
@@ -694,14 +745,9 @@ class DoorBoxInferenceSystem:
         
         return new_x, new_y, new_w, new_h
     
-    def _save_detection_results(self, frame, classification_results):
+    def _save_detection_results(self, frame, classification_results, capture_timestamp, timestamp_str):
         """감지 결과 저장 및 S3 큐 추가"""
         try:
-            # 서울 시간대 설정
-            seoul_tz = pytz.timezone('Asia/Seoul')
-            timestamp = datetime.now(seoul_tz)
-            timestamp_str = timestamp.strftime("%Y%m%d_%H%M%S")
-            
             frame_filename = f"{timestamp_str}_frame.jpg"
             video_filename = f"{timestamp_str}_clip.mp4"
             result_filename = f"{timestamp_str}_result.json"
@@ -709,6 +755,10 @@ class DoorBoxInferenceSystem:
             frame_path = os.path.join(config.LOCAL_FRAMES_DIR, frame_filename)
             video_path = os.path.join(config.LOCAL_VIDEOS_DIR, video_filename)
             result_path = os.path.join(config.LOCAL_RESULTS_DIR, result_filename)
+            
+            # ★ 파일 중복 체크 (추가 안전장치)
+            if os.path.exists(frame_path):
+                self.logger.warning(f"파일이 이미 존재함: {frame_filename} - 덮어쓰기")
             
             # 1. 프레임 저장
             cv2.imwrite(frame_path, frame)
@@ -724,12 +774,12 @@ class DoorBoxInferenceSystem:
                 self.logger.warning("비디오 저장 실패")
                 video_path = None
             
-            # 3. JSON 데이터 생성 (수정된 구조)
-            s3_paths = self._generate_s3_paths(timestamp)
+            # 3. JSON 데이터 생성 - timestamp_str에 맞춰 S3 경로도 조정
+            s3_paths = self._generate_s3_paths_with_custom_filename(capture_timestamp, timestamp_str)
             result_data = {
-                "day": timestamp.strftime("%Y%m%d"),
-                "time": timestamp.strftime("%H:%M:%S"),
-                "image_key": s3_paths['image_key_full_path'],  # doorbox-data 포함 전체 경로
+                "day": capture_timestamp.strftime("%Y%m%d"),
+                "time": capture_timestamp.strftime("%H:%M:%S"),
+                "image_key": s3_paths['image_key_full_path'],
                 "detection_results": {
                     "accessory": classification_results.get("accessory"),
                     "emotion": classification_results.get("emotion"),
@@ -743,10 +793,10 @@ class DoorBoxInferenceSystem:
                 json.dump(result_data, f, ensure_ascii=False, indent=2)
             self.logger.info(f"결과 JSON 저장: {result_filename}")
             
-            # 5. S3 업로드 큐에 추가
-            self._queue_upload_data(frame_path, video_path, result_data)
+            # 5. S3 업로드 큐에 추가 - capture_timestamp 사용
+            self._queue_upload_data(frame_path, video_path, result_data, capture_timestamp)
             
-            # 6. 상세 로그 출력 (모든 분류 결과 표시)
+            # 6. ★ 상세 로그 출력 (고유 파일명 및 대기 캡처 수 포함)
             emotion = classification_results.get("emotion", "unknown")
             emotion_conf = classification_results.get("emotion_confidence", 0.0)
             accessory = classification_results.get("accessory")
@@ -763,15 +813,23 @@ class DoorBoxInferenceSystem:
             else:
                 accessory_text = "마스크 미판별"
             
+            # ★ 개선된 로그 출력 (파일명 및 대기 상태 포함)
+            self.logger.info("=" * 50)
+            self.logger.info(f"🖼️  프레임 파일: {frame_filename}")
+            self.logger.info(f"🕒 캡처 시간: {capture_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+            self.logger.info(f"📊 대기 중인 캡처: {self.pending_captures}개")
             self.logger.info("=== 분류 결과 상세 ===")
             self.logger.info(f"   감정: {emotion} (신뢰도: {emotion_conf:.3f})")
             self.logger.info(f"   악세서리: {accessory_text}")
             self.logger.info(f"   성별: {gender} (신뢰도: {gender_conf:.3f})")
             self.logger.info(f"   연령대: {age_group} (신뢰도: {age_conf:.3f})")
-            self.logger.info("========================")
+            self.logger.info("=" * 50)
+            
+            return True
             
         except Exception as e:
             self.logger.error(f"결과 저장 오류: {e}")
+            return False
     
     def _rtsp_capture_worker(self):
         """RTSP 캡처 스레드 (최적화)"""
@@ -848,11 +906,20 @@ class DoorBoxInferenceSystem:
             self.first_detection_time = current_time
             self.detection_session_id = int(current_time)
             self.last_capture_time = None
+            self.last_successful_capture_time = 0
+            self.pending_captures = 0
+            
+            # ★ 기존 타이머가 있으면 취소
+            if self.capture_timer:
+                self.capture_timer.cancel()
+                self.capture_timer = None
+            
             self.logger.info(f"새로운 감지 세션 시작 (ID: {self.detection_session_id})")
             
             # 첫 감지 후 즉시 또는 지연 후 캡처 시작
             if config.DETECTION_DELAY > 0:
-                threading.Timer(config.DETECTION_DELAY, self._start_periodic_capture).start()
+                self.capture_timer = threading.Timer(config.DETECTION_DELAY, self._start_periodic_capture)
+                self.capture_timer.start()
                 self.logger.info(f"{config.DETECTION_DELAY}초 후 캡처 시작 예정")
             else:
                 self._start_periodic_capture()
@@ -863,13 +930,54 @@ class DoorBoxInferenceSystem:
     
     def _start_periodic_capture(self):
         """주기적 캡처 시작"""
+        if not self.detection_active:
+            return
+        
+        # ★ 캐스케이딩 타이머 방지
+        if self.capture_timer:
+            self.capture_timer.cancel()
+            self.capture_timer = None
+        
+        self.logger.info("캡처 및 분류 시작")
+        
+        # ★ 스레드에서 캡처 실행 (메인 타이머 블로킹 방지)
+        capture_thread = threading.Thread(target=self._execute_capture_safely, daemon=True)
+        capture_thread.start()
+        
+        # 다음 캡처 스케줄링
         if self.detection_active:
-            self.logger.info("캡처 및 분류 시작")
-            self._capture_and_process()
+            self.capture_timer = threading.Timer(config.CAPTURE_INTERVAL, self._start_periodic_capture)
+            self.capture_timer.start()
+    
+    def _execute_capture_safely(self):
+        """안전한 캡처 실행"""
+        with self.capture_lock:
+            if self.capture_in_progress:
+                self.logger.debug("이미 캡처가 진행 중 - 건너뜀")
+                return
             
-            # 다음 캡처 스케줄링
-            if self.detection_active:
-                threading.Timer(config.CAPTURE_INTERVAL, self._start_periodic_capture).start()
+            current_time = time.time()
+            
+            # ★ 최소 간격 체크 (중복 캡처 방지)
+            min_interval = getattr(config, 'MIN_CAPTURE_INTERVAL', 3.0)
+            if current_time - self.last_successful_capture_time < min_interval:
+                self.logger.debug(f"최소 간격({min_interval}초) 미달 - 건너뜀")
+                return
+            
+            self.capture_in_progress = True
+            self.pending_captures += 1
+        
+        try:
+            # 실제 캡처 및 처리 실행
+            success = self._capture_and_process()
+            if success:
+                self.last_successful_capture_time = time.time()
+        except Exception as e:
+            self.logger.error(f"캡처 실행 중 오류: {e}")
+        finally:
+            with self.capture_lock:
+                self.capture_in_progress = False
+                self.pending_captures = max(0, self.pending_captures - 1)
     
     def _capture_and_process(self):
         """캡처 및 처리 실행"""
@@ -883,6 +991,10 @@ class DoorBoxInferenceSystem:
         if current_time - self.first_detection_time > config.DETECTION_TIMEOUT:
             self._end_detection_session()
             return
+        
+        # ★ 캡처 시점의 정확한 타임스탬프 생성 (로그와 파일명 동기화)
+        seoul_tz = pytz.timezone('Asia/Seoul')
+        capture_timestamp = datetime.now(seoul_tz)  # 캡처 시점의 정확한 시간
         
         with self.frame_lock:
             if self.latest_frame is None:
@@ -909,24 +1021,117 @@ class DoorBoxInferenceSystem:
         
         if face_crop.size == 0:
             self.logger.warning("크롭된 얼굴 영역이 비어있음")
-            return
+            return False
+        
+        # ★ 고유 파일명 생성 (중복 방지)
+        base_timestamp_str = capture_timestamp.strftime("%Y%m%d_%H%M%S")
+        unique_timestamp_str = self._generate_unique_filename(base_timestamp_str)
         
         # 모든 모델로 분류 실행
         classification_results = self._classify_all_models(face_crop)
         
-        # 결과 저장 및 S3 업로드 큐 추가
-        self._save_detection_results(current_frame, classification_results)
+        # ★ 결과 저장 (고유 파일명 사용)
+        success = self._save_detection_results(
+            current_frame, 
+            classification_results, 
+            capture_timestamp, 
+            unique_timestamp_str
+        )
         
-        self.last_capture_time = current_time
+        if success:
+            self.last_capture_time = current_time
+            return True
+        
+        return False
     
     def _end_detection_session(self):
         """감지 세션 종료"""
         if self.detection_active:
             self.logger.info(f"감지 세션 종료 (ID: {self.detection_session_id})")
+            
+            # ★ 활성 타이머 취소
+            if self.capture_timer:
+                self.capture_timer.cancel()
+                self.capture_timer = None
+            
             self.detection_active = False
             self.first_detection_time = None
             self.last_capture_time = None
             self.detection_session_id = None
+            self.last_successful_capture_time = 0
+            
+            # ★ 파일명 카운터 정리 (메모리 절약)
+            with self.filename_lock:
+                # 오래된 항목 정리 (1시간 이상 된 것들)
+                current_time = time.time()
+                keys_to_remove = []
+                for filename in self.filename_counter.keys():
+                    try:
+                        # 파일명에서 시간 추출 (YYYYMMDD_HHMMSS 형식)
+                        if '_' in filename:
+                            parts = filename.split('_')
+                            if len(parts) >= 2:
+                                date_part = parts[0]  # YYYYMMDD
+                                time_part = parts[1]  # HHMMSS
+                                datetime_str = date_part + time_part
+                                file_time = datetime.strptime(datetime_str, '%Y%m%d%H%M%S').timestamp()
+                                if current_time - file_time > 3600:  # 1시간
+                                    keys_to_remove.append(filename)
+                    except:
+                        # 파싱 실패한 오래된 키들도 제거
+                        keys_to_remove.append(filename)
+                
+                for key in keys_to_remove:
+                    del self.filename_counter[key]
+                
+                if keys_to_remove:
+                    self.logger.debug(f"파일명 카운터 정리: {len(keys_to_remove)}개 제거")
+    
+    # ★ 추가 유틸리티 함수들
+    def search_logs_by_filename(self, filename_pattern):
+        """파일명 패턴으로 로그 검색 (디버깅용)"""
+        log_file = config.LOG_FILE
+        results = []
+        
+        try:
+            with open(log_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                
+            in_classification_block = False
+            current_block = []
+            
+            for line in lines:
+                if filename_pattern in line and "프레임 파일:" in line:
+                    in_classification_block = True
+                    current_block = [line.strip()]
+                elif in_classification_block:
+                    current_block.append(line.strip())
+                    if "=" * 50 in line:  # 블록 종료
+                        results.append('\n'.join(current_block))
+                        in_classification_block = False
+                        current_block = []
+        
+        except Exception as e:
+            self.logger.error(f"로그 검색 오류: {e}")
+        
+        return results
+    
+    def debug_classification_by_file(self, frame_filename):
+        """특정 프레임 파일의 분류 결과 조회"""
+        # 파일명에서 확장자 제거
+        base_name = frame_filename.replace('_frame.jpg', '').replace('.jpg', '')
+        
+        # 로그에서 해당 파일의 분류 결과 검색
+        results = self.search_logs_by_filename(base_name)
+        
+        if results:
+            print(f"\n🔍 {frame_filename}의 분류 결과:")
+            for result in results:
+                print(result)
+        else:
+            print(f"❌ {frame_filename}에 대한 분류 결과를 찾을 수 없습니다.")
+        
+        return results
     
     def start(self):
         """시스템 시작"""
@@ -997,4 +1202,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
