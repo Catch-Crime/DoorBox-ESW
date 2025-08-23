@@ -20,7 +20,7 @@ import warnings
 
 # Warning 메시지 완전히 숨기기
 warnings.filterwarnings("ignore")
-import torchvision  # 이 import가 warning을 미리 발생시켜서 나중에 안 나옴
+import torchvision  
 
 # 설정 파일 import
 import config
@@ -108,23 +108,22 @@ class DoorBoxInferenceSystem:
     
     def _load_all_models(self):
         """모든 분류 모델 로드"""
-        # 1. 감정 분류 모델 (EfficientNet-B0)
+        # 1. 감정 분류 모델 (EfficientNet-B0) - 320x320
         self.emotion_model = self._load_emotion_model()
-        self.emotion_transform = self._get_emotion_transform()
         
-        # 2. 악세서리(마스크) 분류 모델 (GhostNet)
+        # 2. 악세서리(마스크) 분류 모델 (GhostNet) - 320x320
         self.accessory_model = self._load_ghostnet_model(config.ACCESSORY_MODEL_PATH, "악세서리")
         
-        # 3. 연령대 분류 모델 (EfficientNet-B0)
+        # 3. 연령대 분류 모델 (EfficientNet-B0) - 320x320
         self.age_model = self._load_efficientnet_model(config.AGE_MODEL_PATH, "연령대", num_classes=9)
         
-        # 4. 성별 분류 모델 (MobileNetV3-Small)
+        # 4. 성별 분류 모델 (MobileNetV3-Small) - 320x320
         self.gender_model = self._load_mobilenet_model(config.GENDER_MODEL_PATH, "성별")
         
-        # 공통 전처리 (224x224)
+        # 공통 전처리 (320x320로 통일)
         self.common_transform = transforms.Compose([
             transforms.ToPILImage(),
-            transforms.Resize((224, 224)),
+            transforms.Resize((320, 320)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], 
                                std=[0.229, 0.224, 0.225])
@@ -136,7 +135,7 @@ class DoorBoxInferenceSystem:
             model = efficientnet_b0(pretrained=False)
             model.classifier = nn.Sequential(
                 nn.Dropout(0.2),
-                nn.Linear(1280, 2)  # negative, non-negative
+                nn.Linear(1280, 2)  # alert, non-alert
             )
             
             checkpoint = torch.load(config.EMOTION_MODEL_PATH, map_location='cpu')
@@ -299,23 +298,12 @@ class DoorBoxInferenceSystem:
             self.logger.error(f"{model_name} 모델 로드 실패: {e}")
             return None
     
-    def _get_emotion_transform(self):
-        """감정 분류용 이미지 전처리"""
-        return transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((320, 320)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                               std=[0.229, 0.224, 0.225])
-        ])
-    
     def _classify_all_models(self, face_crop):
         """모든 모델로 분류 실행"""
         results = {
             "emotion": None,
             "emotion_confidence": 0.0,
-            "has_mask": None,
-            "mask_confidence": 0.0,
+            "accessory": None,  # has_mask → accessory로 변경
             "gender": None,
             "gender_confidence": 0.0,
             "age_group": None,
@@ -323,18 +311,17 @@ class DoorBoxInferenceSystem:
         }
         
         try:
-            # 1. 악세서리(마스크) 분류 - 우선 실행
+            # 1. 악세서리(마스크) 분류 - 우선 실행 (confidence 제외)
             if self.accessory_model is not None:
-                mask_result, mask_conf = self._classify_accessory(face_crop)
-                results["has_mask"] = mask_result
-                results["mask_confidence"] = mask_conf
+                accessory_result = self._classify_accessory(face_crop)
+                results["accessory"] = accessory_result
                 
                 # 마스크 착용시 다른 분류 건너뛰기
-                if mask_result:
+                if accessory_result:
                     self.logger.info("마스크 착용 감지 - 다른 분류 생략")
                     return results
             
-            # 2. 감정 분류
+            # 2. 감정 분류 (alert/non-alert로 변경)
             if self.emotion_model is not None:
                 emotion, emotion_conf = self._classify_emotion(face_crop)
                 results["emotion"] = emotion
@@ -358,19 +345,19 @@ class DoorBoxInferenceSystem:
         return results
     
     def _classify_emotion(self, face_crop):
-        """감정 분류"""
+        """감정 분류 (alert/non-alert)"""
         if self.emotion_model is None:
             return "unknown", 0.0
         
         try:
-            input_tensor = self.emotion_transform(face_crop).unsqueeze(0)
+            input_tensor = self.common_transform(face_crop).unsqueeze(0)
             
             with torch.no_grad():
                 outputs = self.emotion_model(input_tensor)
                 probabilities = torch.softmax(outputs, dim=1)
                 confidence, predicted = torch.max(probabilities, 1)
                 
-                emotion_classes = ["negative", "non-negative"]
+                emotion_classes = ["alert", "non-alert"]  # negative → alert, non-negative → non-alert
                 emotion = emotion_classes[predicted.item()]
                 conf = confidence.item()
                 
@@ -380,9 +367,9 @@ class DoorBoxInferenceSystem:
             return "unknown", 0.0
     
     def _classify_accessory(self, face_crop):
-        """악세서리(마스크) 분류"""
+        """악세서리(마스크) 분류 - confidence 제외"""
         if self.accessory_model is None:
-            return None, 0.0
+            return None
         
         try:
             input_tensor = self.common_transform(face_crop).unsqueeze(0)
@@ -414,14 +401,14 @@ class DoorBoxInferenceSystem:
                 if conf < 0.7:
                     has_mask = False
                 
-                return has_mask, conf
+                return has_mask  # confidence 제외하고 boolean만 반환
         except Exception as e:
             self.logger.error(f"악세서리 분류 오류: {e}")
             # 에러 발생시 기본값 반환
-            return False, 0.0
+            return False
     
     def _classify_gender(self, face_crop):
-        """성별 분류"""
+        """성별 분류 (0=male, 1=female)"""
         if self.gender_model is None:
             return "unknown", 0.0
         
@@ -433,7 +420,7 @@ class DoorBoxInferenceSystem:
                 probabilities = torch.softmax(outputs, dim=1)
                 confidence, predicted = torch.max(probabilities, 1)
                 
-                gender_classes = ["male", "female"]
+                gender_classes = ["male", "female"]  # 0=male, 1=female
                 gender = gender_classes[predicted.item()]
                 conf = confidence.item()
                 
@@ -443,7 +430,7 @@ class DoorBoxInferenceSystem:
             return "unknown", 0.0
     
     def _classify_age(self, face_crop):
-        """연령대 분류 (EfficientNet-B0, 9클래스)"""
+        """연령대 분류 (EfficientNet-B0, 9클래스: 0s, 10s, 20s, ..., 70s, over80s)"""
         if self.age_model is None:
             return "unknown", 0.0
         
@@ -455,8 +442,8 @@ class DoorBoxInferenceSystem:
                 probabilities = torch.softmax(outputs, dim=1)
                 confidence, predicted = torch.max(probabilities, 1)
                 
-                # 9개 클래스로 확장 (실제 클래스명은 모델에 따라 조정)
-                age_classes = ["0-9", "10-19", "20-29", "30-39", "40-49", "50-59", "60-69", "70-79", "80+"]
+                # 9개 클래스: 0s, 10s, 20s, 30s, 40s, 50s, 60s, 70s, over80s
+                age_classes = ["0s", "10s", "20s", "30s", "40s", "50s", "60s", "70s", "over80s"]
                 age_group = age_classes[predicted.item()]
                 conf = confidence.item()
                 
@@ -556,7 +543,7 @@ class DoorBoxInferenceSystem:
         self.logger.info(f"S3 큐 추가 - 대기중: {len(self.upload_queue)}개")
     
     def _generate_s3_paths(self, timestamp):
-        """S3 경로 생성 (서울 시간대 기준)"""
+        """S3 경로 생성 (중복 제거된 구조)"""
         # timestamp가 이미 서울 시간대면 그대로, 아니면 변환
         if timestamp.tzinfo is None or timestamp.tzinfo.utcoffset(timestamp) is None:
             # naive datetime이면 서울 시간대로 가정
@@ -567,16 +554,21 @@ class DoorBoxInferenceSystem:
             seoul_tz = pytz.timezone('Asia/Seoul')
             dt = timestamp.astimezone(seoul_tz)
         
+        # S3 저장 구조 (버킷 내부): home-1/cam-1/2025/08/23/...
         folder_name = f"{dt.year:04d}{dt.month:02d}{dt.day:02d}_{dt.hour:02d}{dt.minute:02d}{dt.second:02d}_log"
         
-        base_path = f"{dt.year:04d}/{dt.month:02d}/{dt.day:02d}/{folder_name}"
+        base_path = f"home-1/cam-1/{dt.year:04d}/{dt.month:02d}/{dt.day:02d}/{folder_name}"
         file_prefix = f"{dt.year:04d}{dt.month:02d}{dt.day:02d}_{dt.hour:02d}{dt.minute:02d}{dt.second:02d}"
+        
+        # JSON의 image_key는 전체 경로 (doorbox-data 포함)
+        image_key_full_path = f"doorbox-data/home-1/cam-1/{dt.year:04d}/{dt.month:02d}/{dt.day:02d}/{folder_name}/{file_prefix}_frame.jpg"
         
         return {
             'base_path': base_path,
             'frame_key': f"{base_path}/{file_prefix}_frame.jpg",
             'video_key': f"{base_path}/{file_prefix}_clip.mp4",
-            'result_key': f"{base_path}/{file_prefix}_result.json"
+            'result_key': f"{base_path}/{file_prefix}_result.json",
+            'image_key_full_path': image_key_full_path  # JSON용 전체 경로
         }
     
     def _upload_file_to_s3(self, local_path, s3_key, content_type):
@@ -620,8 +612,8 @@ class DoorBoxInferenceSystem:
             try:
                 s3_paths = self._generate_s3_paths(item['timestamp'])
                 
-                # 이미지 키 설정
-                item['result_data']['image_key'] = f"{config.AWS_BUCKET_NAME}/{s3_paths['frame_key']}"
+                # JSON에 이미 image_key가 설정되어 있음
+                # 별도로 설정할 필요 없음
                 
                 # 1. JSON 업로드
                 if self._upload_json_to_s3(item['result_data'], s3_paths['result_key']):
@@ -689,14 +681,6 @@ class DoorBoxInferenceSystem:
         center_x = x + w // 2
         center_y = y + h // 2
         
-    def _expand_bbox(self, bbox, frame_shape, scale=1.5):
-        """바운딩 박스 1.5배 확장"""
-        x, y, w, h = bbox
-        frame_h, frame_w = frame_shape[:2]
-        
-        center_x = x + w // 2
-        center_y = y + h // 2
-        
         new_w = int(w * scale)
         new_h = int(h * scale)
         
@@ -740,18 +724,18 @@ class DoorBoxInferenceSystem:
                 self.logger.warning("비디오 저장 실패")
                 video_path = None
             
-            # 3. JSON 데이터 생성 (서울 시간대)
+            # 3. JSON 데이터 생성 (수정된 구조)
+            s3_paths = self._generate_s3_paths(timestamp)
             result_data = {
                 "day": timestamp.strftime("%Y%m%d"),
                 "time": timestamp.strftime("%H:%M:%S"),
+                "image_key": s3_paths['image_key_full_path'],  # doorbox-data 포함 전체 경로
                 "detection_results": {
+                    "accessory": classification_results.get("accessory"),
                     "emotion": classification_results.get("emotion"),
-                    "confidence": round(classification_results.get("emotion_confidence", 0.0), 3),
-                    "has_mask": classification_results.get("has_mask"),
                     "gender": classification_results.get("gender"),
                     "age_group": classification_results.get("age_group")
-                },
-                "image_key": ""  # S3 업로드시 설정
+                }
             }
             
             # 4. 로컬에 JSON 파일 저장
@@ -765,24 +749,23 @@ class DoorBoxInferenceSystem:
             # 6. 상세 로그 출력 (모든 분류 결과 표시)
             emotion = classification_results.get("emotion", "unknown")
             emotion_conf = classification_results.get("emotion_confidence", 0.0)
-            has_mask = classification_results.get("has_mask")
-            mask_conf = classification_results.get("mask_confidence", 0.0)
+            accessory = classification_results.get("accessory")
             gender = classification_results.get("gender", "unknown")
             gender_conf = classification_results.get("gender_confidence", 0.0)
             age_group = classification_results.get("age_group", "unknown")
             age_conf = classification_results.get("age_confidence", 0.0)
             
-            # 마스크 상태 텍스트
-            if has_mask is True:
-                mask_text = f"마스크 착용({mask_conf:.3f})"
-            elif has_mask is False:
-                mask_text = f"마스크 없음({mask_conf:.3f})"
+            # 악세서리 상태 텍스트 (confidence 없음)
+            if accessory is True:
+                accessory_text = "마스크 착용"
+            elif accessory is False:
+                accessory_text = "마스크 없음"
             else:
-                mask_text = "마스크 미판별"
+                accessory_text = "마스크 미판별"
             
             self.logger.info("=== 분류 결과 상세 ===")
             self.logger.info(f"   감정: {emotion} (신뢰도: {emotion_conf:.3f})")
-            self.logger.info(f"   마스크: {mask_text}")
+            self.logger.info(f"   악세서리: {accessory_text}")
             self.logger.info(f"   성별: {gender} (신뢰도: {gender_conf:.3f})")
             self.logger.info(f"   연령대: {age_group} (신뢰도: {age_conf:.3f})")
             self.logger.info("========================")
@@ -1014,3 +997,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
