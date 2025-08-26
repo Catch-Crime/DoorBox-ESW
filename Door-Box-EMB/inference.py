@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 from torchvision.models import efficientnet_b0, mobilenet_v3_small
-import timm
+import timm  # GhostNet을 위해 필요
 import serial
 import threading
 import time
@@ -24,6 +24,350 @@ import torchvision
 
 # 설정 파일 import
 import config
+
+# ================= PIR, OLED, RGB LED 관련 추가 =================
+# GPIO library detection
+try:
+    from gpiozero import LED, MotionSensor
+    GPIO_METHOD = "gpiozero"
+    print("✅ Using gpiozero library")
+except ImportError:
+    GPIO_METHOD = "direct"
+    print("✅ Using direct GPIO control")
+
+# I2C OLED library
+try:
+    import smbus2 as smbus
+    I2C_AVAILABLE = True
+    print("✅ Using smbus2 for OLED")
+except ImportError:
+    try:
+        import smbus
+        I2C_AVAILABLE = True
+        print("✅ Using smbus for OLED")
+    except ImportError:
+        I2C_AVAILABLE = False
+        print("❌ I2C library not available")
+
+from PIL import Image, ImageDraw, ImageFont
+
+class RGBController:
+    """RGB LED Controller (Common Cathode)"""
+    
+    def __init__(self):
+        self.pins = {'RED': 18, 'GREEN': 23, 'BLUE': 24}  # GPIO numbers
+        
+        if GPIO_METHOD == "gpiozero":
+            self._init_gpiozero()
+        else:
+            self._init_direct()
+        
+        # Turn off all LEDs initially
+        self.set_rgb(0, 0, 0)
+        print("✅ RGB LED initialized (Common Cathode)")
+    
+    def _init_gpiozero(self):
+        """Initialize using gpiozero"""
+        self.red_led = LED(18)    # Pin 12
+        self.green_led = LED(23)  # Pin 16  
+        self.blue_led = LED(24)   # Pin 18
+    
+    def _init_direct(self):
+        """Initialize using direct GPIO control"""
+        # Cleanup existing GPIO
+        for pin in self.pins.values():
+            try:
+                with open('/sys/class/gpio/unexport', 'w') as f:
+                    f.write(str(pin))
+            except:
+                pass
+        
+        # Export and setup
+        for pin in self.pins.values():
+            with open('/sys/class/gpio/export', 'w') as f:
+                f.write(str(pin))
+            time.sleep(0.1)
+            with open(f'/sys/class/gpio/gpio{pin}/direction', 'w') as f:
+                f.write('out')
+    
+    def _set_pin_value(self, pin, value):
+        """Set GPIO pin value (direct method)"""
+        try:
+            with open(f'/sys/class/gpio/gpio{pin}/value', 'w') as f:
+                f.write(str(value))
+        except Exception as e:
+            print(f"GPIO {pin} error: {e}")
+    
+    def set_rgb(self, r, g, b):
+        """Set RGB color (0-255 each)"""
+        # Convert 0-255 to 0/1 (threshold at 128)
+        red_val = 1 if r > 128 else 0
+        green_val = 1 if g > 128 else 0
+        blue_val = 1 if b > 128 else 0
+        
+        if GPIO_METHOD == "gpiozero":
+            # gpiozero: on()=HIGH, off()=LOW
+            if red_val:
+                self.red_led.on()
+            else:
+                self.red_led.off()
+                
+            if green_val:
+                self.green_led.on()
+            else:
+                self.green_led.off()
+                
+            if blue_val:
+                self.blue_led.on()
+            else:
+                self.blue_led.off()
+        else:
+            # Direct GPIO control
+            self._set_pin_value(self.pins['RED'], red_val)
+            self._set_pin_value(self.pins['GREEN'], green_val)
+            self._set_pin_value(self.pins['BLUE'], blue_val)
+    
+    def set_color_by_name(self, color_name):
+        """Set color by predefined names"""
+        colors = {
+            "red": (255, 0, 0),
+            "green": (0, 255, 0),
+            "blue": (0, 0, 255),
+            "yellow": (255, 255, 0),
+            "white": (255, 255, 255),
+            "purple": (255, 0, 255),
+            "off": (0, 0, 0)
+        }
+        if color_name in colors:
+            self.set_rgb(*colors[color_name])
+    
+    def blink_purple(self, times=3, interval=0.3):
+        """보라색 LED를 지정된 횟수만큼 깜빡임"""
+        for i in range(times):
+            self.set_rgb(255, 0, 255)  # 보라색 켜기
+            time.sleep(interval)
+            self.set_rgb(0, 0, 0)      # LED 끄기
+            time.sleep(interval)
+    
+    def cleanup(self):
+        """Cleanup GPIO resources"""
+        try:
+            self.set_rgb(0, 0, 0)
+        except:
+            pass  # 이미 종료된 경우 무시
+        
+        if GPIO_METHOD == "gpiozero":
+            try:
+                if hasattr(self, 'red_led') and self.red_led:
+                    self.red_led.close()
+                if hasattr(self, 'green_led') and self.green_led:
+                    self.green_led.close()
+                if hasattr(self, 'blue_led') and self.blue_led:
+                    self.blue_led.close()
+            except:
+                pass
+        else:
+            for pin in self.pins.values():
+                try:
+                    with open('/sys/class/gpio/unexport', 'w') as f:
+                        f.write(str(pin))
+                except:
+                    pass
+
+class OLEDDisplay:
+    """Simple OLED Display Controller"""
+    
+    def __init__(self):
+        if not I2C_AVAILABLE:
+            raise Exception("I2C library not available")
+        
+        self.bus = smbus.SMBus(1)
+        self.addr = 0x3C
+        self.width = 128
+        self.height = 64
+        
+        # Initialize OLED
+        init_sequence = [
+            0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40,
+            0x8D, 0x14, 0x20, 0x00, 0xA1, 0xC8, 0xDA, 0x12,
+            0x81, 0x7F, 0xD9, 0x22, 0xDB, 0x20, 0xA4, 0xA6, 0xAF
+        ]
+        
+        for cmd in init_sequence:
+            self.bus.write_byte_data(self.addr, 0x00, cmd)
+        
+        # Load font
+        try:
+            self.font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 10)
+            self.font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 8)
+        except:
+            self.font = ImageFont.load_default()
+            self.font_small = ImageFont.load_default()
+        
+        self.clear()
+        print("✅ OLED display initialized")
+    
+    def clear(self):
+        """Clear the display"""
+        for page in range(8):
+            self.bus.write_byte_data(self.addr, 0x00, 0xB0 + page)
+            self.bus.write_byte_data(self.addr, 0x00, 0x00)
+            self.bus.write_byte_data(self.addr, 0x00, 0x10)
+            
+            for col in range(128):
+                self.bus.write_byte_data(self.addr, 0x40, 0x00)
+    
+    def display_text(self, lines):
+        """Display text lines with improved error handling"""
+        if not hasattr(self, 'display_lock'):
+            self.display_lock = threading.Lock()
+        
+        with self.display_lock:
+            try:
+                image = Image.new("1", (self.width, self.height))
+                draw = ImageDraw.Draw(image)
+                
+                y = 0
+                for i, line in enumerate(lines[:6]):
+                    font = self.font if i == 0 else self.font_small
+                    # 문자열 길이 제한으로 깨짐 방지
+                    line_str = str(line)[:20] if len(str(line)) > 20 else str(line)
+                    draw.text((0, y), line_str, font=font, fill=1)
+                    y += 11 if i == 0 else 10
+                
+                pixels = list(image.getdata())
+                
+                # OLED 업데이트를 더 안정적으로
+                for page in range(8):
+                    try:
+                        self.bus.write_byte_data(self.addr, 0x00, 0xB0 + page)
+                        self.bus.write_byte_data(self.addr, 0x00, 0x00)
+                        self.bus.write_byte_data(self.addr, 0x00, 0x10)
+                        
+                        for col in range(128):
+                            byte_val = 0
+                            for bit in range(8):
+                                pixel_y = page * 8 + bit
+                                if pixel_y < 64:
+                                    pixel_idx = pixel_y * 128 + col
+                                    if pixel_idx < len(pixels) and pixels[pixel_idx]:
+                                        byte_val |= (1 << bit)
+                            
+                            self.bus.write_byte_data(self.addr, 0x40, byte_val)
+                    except Exception as e:
+                        # 페이지 업데이트 실패시 계속 진행
+                        continue
+                        
+            except Exception as e:
+                # 전체 디스플레이 업데이트 실패시 조용히 무시
+                pass
+
+class PIRSensor:
+    """PIR Motion Sensor Controller"""
+    
+    def __init__(self):
+        self.pir_pin = 14  # GPIO14 (Pin 8)
+        self.last_detection = None
+        self.detection_count = 0
+        self.motion_callback = None
+        
+        if GPIO_METHOD == "gpiozero":
+            self._init_gpiozero()
+        else:
+            self._init_direct()
+        
+        print("✅ PIR sensor initialized (GPIO14)")
+    
+    def _init_gpiozero(self):
+        """Initialize PIR using gpiozero"""
+        self.pir_sensor = MotionSensor(self.pir_pin)
+        self.pir_sensor.when_motion = self._motion_detected
+    
+    def _init_direct(self):
+        """Initialize PIR using direct GPIO"""
+        try:
+            with open('/sys/class/gpio/unexport', 'w') as f:
+                f.write(str(self.pir_pin))
+        except:
+            pass
+        
+        with open('/sys/class/gpio/export', 'w') as f:
+            f.write(str(self.pir_pin))
+        time.sleep(0.1)
+        
+        with open(f'/sys/class/gpio/gpio{self.pir_pin}/direction', 'w') as f:
+            f.write('in')
+        
+        self.last_state = 0
+    
+    def set_callback(self, callback):
+        """Set motion detection callback"""
+        self.motion_callback = callback
+    
+    def _motion_detected(self):
+        """Motion detection callback"""
+        self.detection_count += 1
+        self.last_detection = datetime.now()
+        
+        print(f"🚶 PIR Motion detected! Count: {self.detection_count}")
+        print(f"   Time: {self.last_detection.strftime('%H:%M:%S')}")
+        
+        if self.motion_callback:
+            self.motion_callback()
+    
+    def check_motion_direct(self):
+        """Check motion for direct GPIO method"""
+        if GPIO_METHOD != "direct":
+            return False
+            
+        try:
+            with open(f'/sys/class/gpio/gpio{self.pir_pin}/value', 'r') as f:
+                current_state = int(f.read().strip())
+            
+            if current_state == 1 and self.last_state == 0:
+                self.last_state = current_state
+                self._motion_detected()
+                return True
+            
+            self.last_state = current_state
+            return False
+            
+        except Exception as e:
+            print(f"PIR read error: {e}")
+            return False
+    
+    def get_status(self):
+        """Get current PIR status"""
+        if GPIO_METHOD == "gpiozero":
+            try:
+                current_value = self.pir_sensor.motion_detected
+            except:
+                current_value = False
+        else:
+            try:
+                with open(f'/sys/class/gpio/gpio{self.pir_pin}/value', 'r') as f:
+                    current_value = int(f.read().strip())
+            except:
+                current_value = 0
+        
+        return {
+            'active': bool(current_value),
+            'count': self.detection_count,
+            'last_detection': self.last_detection
+        }
+    
+    def cleanup(self):
+        """Cleanup PIR resources"""
+        if GPIO_METHOD == "gpiozero":
+            self.pir_sensor.close()
+        else:
+            try:
+                with open('/sys/class/gpio/unexport', 'w') as f:
+                    f.write(str(self.pir_pin))
+            except:
+                pass
+
+# ================= 기존 DoorBox 클래스 확장 =================
 
 class DoorBoxInferenceSystem:
     def __init__(self):
@@ -47,8 +391,11 @@ class DoorBoxInferenceSystem:
         self.ser = None
         self.running = False
         
-        # 모델들 로드
-        self._load_all_models()
+        # ★ PIR, OLED, RGB LED 초기화
+        self._init_hardware_components()
+        
+        # 모델들 로드 (ACC 제외)
+        self._load_models_except_accessory()
         
         # 비디오 레코더 초기화
         self._init_video_recorder()
@@ -59,29 +406,194 @@ class DoorBoxInferenceSystem:
         # 스레드 관리
         self.rtsp_thread = None
         self.serial_thread = None
+        self.pir_monitor_thread = None
         
         # 프레임 버퍼
         self.latest_frame = None
         self.frame_lock = threading.Lock()
         
-        # 감지 상태 관리
-        self.detection_active = False
-        self.first_detection_time = None
-        self.last_capture_time = None
-        self.detection_session_id = None
+        # 업로드 상태 초기화 (OLED 오류 해결)
+        self.upload_status = {"active": False, "queue_size": 0}
         
-        # ★ 캡처 상태 관리 강화
-        self.capture_in_progress = False  # 캡처 진행 중 플래그
-        self.capture_lock = threading.Lock()  # 캡처 동기화용
-        self.last_successful_capture_time = 0  # 마지막 성공한 캡처 시간
-        self.capture_timer = None  # 현재 활성화된 타이머
-        self.pending_captures = 0  # 대기 중인 캡처 수
+        # PIR 기반 상태 관리
+        self.system_state = "STANDBY"  # STANDBY, PIR_DETECTED, INFERENCE_ACTIVE
+        self.pir_detection_time = None
+        self.inference_timeout = 15.0  # 15초
+        # 초록색 박스 감지 및 캡처 관리
+        self.green_box_detected = False
+        self.first_green_box_time = None
+        self.last_capture_time = 0
+        self.capture_delay = 2.0  # 첫 감지 후 2초 지연
+        self.capture_interval = 5.0  # 5초 간격으로 캡처
         
-        # ★ 파일명 중복 방지를 위한 카운터
-        self.filename_counter = {}  # {base_filename: count}
+        # OLED 분류 결과 표시 관리
+        self.face_detection_results = None
+        self.classification_display_start = None
+        self.classification_display_duration = 3.0  # 3초 동안 표시
+        
+        # 기존 캡처 상태 관리
+        self.capture_in_progress = False
+        self.capture_lock = threading.Lock()
+        self.last_successful_capture_time = 0
+        self.capture_timer = None
+        self.pending_captures = 0
+        
+        # 파일명 중복 방지를 위한 카운터
+        self.filename_counter = {}
         self.filename_lock = threading.Lock()
         
-        self.logger.info("DoorBox 추론 시스템 초기화 완료")
+        self.logger.info("DoorBox 추론 시스템 초기화 완료 (PIR 통합)")
+    
+    def _init_hardware_components(self):
+        """PIR, OLED, RGB LED 초기화"""
+        # RGB LED 초기화
+        try:
+            self.rgb = RGBController()
+            self.rgb_available = True
+            self.rgb.set_color_by_name("red")  # 초기 대기 상태는 빨간색
+            self.logger.info("✅ RGB LED 초기화 완료")
+        except Exception as e:
+            self.logger.error(f"RGB LED 초기화 실패: {e}")
+            self.rgb_available = False
+        
+        # OLED 디스플레이 초기화
+        try:
+            self.oled = OLEDDisplay()
+            self.oled_available = True
+            self.logger.info("✅ OLED 디스플레이 초기화 완료")
+        except Exception as e:
+            self.logger.error(f"OLED 초기화 실패: {e}")
+            self.oled_available = False
+        
+        # PIR 센서 초기화
+        try:
+            self.pir = PIRSensor()
+            self.pir.set_callback(self.on_pir_motion_detected)
+            self.pir_available = True
+            self.logger.info("✅ PIR 센서 초기화 완료")
+        except Exception as e:
+            self.logger.error(f"PIR 센서 초기화 실패: {e}")
+            self.pir_available = False
+    
+    def on_pir_motion_detected(self):
+        """PIR 센서 모션 감지 콜백"""
+        self.logger.info("PIR 모션 감지 - 인퍼런스 모드 시작")
+        self.system_state = "PIR_DETECTED"
+        self.pir_detection_time = time.time()
+        
+        # RGB LED 흰색으로 변경 (PIR 감지됨)
+        if self.rgb_available:
+            self.rgb.set_color_by_name("white")
+        
+        # OLED 업데이트
+        self._update_oled_display()
+    
+    def _update_oled_display(self):
+        """OLED 디스플레이 업데이트 (분류 결과 3초 유지)"""
+        if not self.oled_available:
+            return
+        
+        try:
+            current_time = time.time()
+            pir_status = self.pir.get_status() if self.pir_available else None
+            
+            lines = [
+                "DoorBox v2.0",
+                f"Time: {datetime.now().strftime('%H:%M:%S')}",
+                f"State: {self.system_state}",
+            ]
+            
+            # PIR 상태 표시
+            if pir_status:
+                pir_state = "ACTIVE" if pir_status['active'] else "idle"
+                lines.append(f"PIR: {pir_state} ({pir_status['count']})")
+            else:
+                lines.append("PIR: disabled")
+            
+            # 분류 결과가 있고 3초 이내인 경우 우선 표시
+            if (self.face_detection_results and 
+                self.classification_display_start and 
+                current_time - self.classification_display_start < self.classification_display_duration):
+                
+                emotion = self.face_detection_results.get("emotion", "N/A")
+                gender = self.face_detection_results.get("gender", "N/A")
+                age_group = self.face_detection_results.get("age_group", "N/A")
+                
+                lines.append("=== RESULT ===")
+                lines.append(f"Emotion: {emotion}")
+                lines.append(f"Gender: {gender}")
+                lines.append(f"Age: {age_group}")
+                
+            else:
+                # 일반 상태 정보 표시
+                if self.system_state == "STANDBY":
+                    lines.append("Status: Waiting...")
+                    
+                elif self.system_state == "PIR_DETECTED":
+                    if self.pir_detection_time:
+                        elapsed = current_time - self.pir_detection_time
+                        lines.append(f"PIR Timer: {elapsed:.1f}s")
+                    
+                elif self.system_state == "INFERENCE_ACTIVE":
+                    if self.green_box_detected:
+                        if self.first_green_box_time:
+                            time_since_detection = current_time - self.first_green_box_time
+                            if self.last_capture_time == 0 and time_since_detection < self.capture_delay:
+                                remaining = self.capture_delay - time_since_detection
+                                lines.append(f"Capture in {remaining:.1f}s")
+                            else:
+                                lines.append("Green Box: FOUND")
+                    else:
+                        lines.append("Green Box: Searching...")
+                
+                # S3 업로드 상태
+                if self.upload_status["active"]:
+                    lines.append(f"Upload: {self.upload_status['queue_size']} pending")
+            
+            # 최대 6줄까지만 표시
+            self.oled.display_text(lines[:6])
+            
+        except Exception as e:
+            self.logger.error(f"OLED 업데이트 오류: {e}")
+    
+    def _pir_monitor_worker(self):
+        """PIR 센서 모니터링 스레드 (direct GPIO용)"""
+        while self.running:
+            if self.pir_available and GPIO_METHOD == "direct":
+                self.pir.check_motion_direct()
+            
+            # 상태별 처리
+            current_time = time.time()
+            
+            if self.system_state == "PIR_DETECTED":
+                # PIR 감지 후 즉시 인퍼런스 활성 모드로 전환
+                self.system_state = "INFERENCE_ACTIVE"
+                self.logger.info("🔄 인퍼런스 활성 모드로 전환")
+                
+            elif self.system_state == "INFERENCE_ACTIVE":
+                # 15초 타임아웃 체크
+                if self.pir_detection_time and (current_time - self.pir_detection_time) > self.inference_timeout:
+                    self.logger.info("⏰ 인퍼런스 타임아웃 - 대기 모드로 복귀")
+                    self._return_to_standby()
+            
+            # OLED 주기적 업데이트
+            self._update_oled_display()
+            
+            time.sleep(0.1)  # 100ms 간격으로 체크
+    
+    def _return_to_standby(self):
+        """대기 모드로 복귀"""
+        self.system_state = "STANDBY"
+        self.pir_detection_time = None
+        self.green_box_detected = False
+        self.face_detection_results = None
+        
+        # RGB LED 빨간색으로 변경 (대기 상태)
+        if self.rgb_available:
+            self.rgb.set_color_by_name("red")
+        
+        # OLED 업데이트
+        self._update_oled_display()
     
     def _setup_logging(self):
         """로깅 설정"""
@@ -117,13 +629,13 @@ class DoorBoxInferenceSystem:
         except Exception as e:
             self.logger.error(f"S3 버킷 연결 실패: {e}")
     
-    def _load_all_models(self):
-        """모든 분류 모델 로드"""
+    def _load_models_except_accessory(self):
+        """ACC 제외한 분류 모델들만 로드"""
         # 1. 감정 분류 모델 (EfficientNet-B0) - 320x320
         self.emotion_model = self._load_emotion_model()
         
-        # 2. 악세서리(마스크) 분류 모델 (GhostNet) - 320x320
-        self.accessory_model = self._load_ghostnet_model(config.ACCESSORY_MODEL_PATH, "악세서리")
+        # 2. 악세서리(마스크) 분류 모델 제외
+        self.accessory_model = None
         
         # 3. 연령대 분류 모델 (EfficientNet-B0) - 320x320
         self.age_model = self._load_efficientnet_model(config.AGE_MODEL_PATH, "연령대", num_classes=9)
@@ -310,11 +822,10 @@ class DoorBoxInferenceSystem:
             return None
     
     def _classify_all_models(self, face_crop):
-        """모든 모델로 분류 실행"""
+        """모든 모델로 분류 실행 (ACC 분류 제외)"""
         results = {
             "emotion": None,
             "emotion_confidence": 0.0,
-            "accessory": None,  # has_mask → accessory로 변경
             "gender": None,
             "gender_confidence": 0.0,
             "age_group": None,
@@ -322,29 +833,21 @@ class DoorBoxInferenceSystem:
         }
         
         try:
-            # 1. 악세서리(마스크) 분류 - 우선 실행 (confidence 제외)
-            if self.accessory_model is not None:
-                accessory_result = self._classify_accessory(face_crop)
-                results["accessory"] = accessory_result
-                
-                # 마스크 착용시 다른 분류 건너뛰기
-                if accessory_result:
-                    self.logger.info("마스크 착용 감지 - 다른 분류 생략")
-                    return results
+            # ACC(악세서리) 분류 제외됨
             
-            # 2. 감정 분류 (alert/non-alert로 변경)
+            # 1. 감정 분류 (alert/non-alert로 변경)
             if self.emotion_model is not None:
                 emotion, emotion_conf = self._classify_emotion(face_crop)
                 results["emotion"] = emotion
                 results["emotion_confidence"] = emotion_conf
             
-            # 3. 성별 분류
+            # 2. 성별 분류
             if self.gender_model is not None:
                 gender, gender_conf = self._classify_gender(face_crop)
                 results["gender"] = gender
                 results["gender_confidence"] = gender_conf
             
-            # 4. 연령대 분류
+            # 3. 연령대 분류
             if self.age_model is not None:
                 age_group, age_conf = self._classify_age(face_crop)
                 results["age_group"] = age_group
@@ -484,9 +987,10 @@ class DoorBoxInferenceSystem:
         self.buffer_thread = threading.Thread(target=buffer_frames, daemon=True)
         self.buffer_thread.start()
     
-    def _save_video_clip(self, detection_time, output_path):
-        """5초 비디오 클립 저장"""
+    def _save_video_clip_improved(self, detection_time, output_path):
+        """개선된 5초 비디오 클립 저장 (MP4 코덱만 사용)"""
         if not self.frame_buffer:
+            self.logger.error("프레임 버퍼가 비어있음")
             return False
         
         try:
@@ -495,23 +999,53 @@ class DoorBoxInferenceSystem:
             start_time = detection_time - config.PRE_BUFFER_DURATION
             end_time = detection_time + config.POST_BUFFER_DURATION
             
-            for frame, timestamp in self.frame_buffer:
+            self.logger.debug(f"비디오 클립 시간 범위: {start_time:.2f} ~ {end_time:.2f}")
+            self.logger.debug(f"프레임 버퍼 크기: {len(self.frame_buffer)}개")
+            
+            for frame, timestamp in list(self.frame_buffer):
                 if start_time <= timestamp <= end_time:
                     clip_frames.append(frame)
             
+            self.logger.debug(f"클립용 프레임 수집: {len(clip_frames)}개")
+            
             if len(clip_frames) < 10:
+                self.logger.warning(f"클립 프레임 부족: {len(clip_frames)}개 (최소 10개 필요)")
                 return False
             
-            # 비디오 파일로 저장
+            # 디렉토리 확인
+            output_dir = os.path.dirname(output_path)
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir, exist_ok=True)
+                self.logger.info(f"비디오 디렉토리 생성: {output_dir}")
+            
+            # 비디오 파일로 저장 (MP4 코덱만 사용)
             height, width = clip_frames[0].shape[:2]
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_path, fourcc, 30.0, (width, height))
             
-            for frame in clip_frames:
-                out.write(frame)
-            
-            out.release()
-            return True
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(output_path, fourcc, 30.0, (width, height))
+                
+                if not out.isOpened():
+                    self.logger.error("MP4 VideoWriter 열기 실패")
+                    return False
+                
+                # 프레임 쓰기
+                for frame in clip_frames:
+                    out.write(frame)
+                
+                out.release()
+                
+                # 파일 생성 확인
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    self.logger.info("비디오 저장 성공 (MP4)")
+                    return True
+                else:
+                    self.logger.error("MP4 파일 생성 실패")
+                    return False
+                    
+            except Exception as e:
+                self.logger.error(f"MP4 비디오 저장 오류: {e}")
+                return False
             
         except Exception as e:
             self.logger.error(f"비디오 저장 오류: {e}")
@@ -527,6 +1061,12 @@ class DoorBoxInferenceSystem:
         """S3 업로드 스레드 시작"""
         def upload_worker():
             while self.upload_running:
+                # 업로드 상태 업데이트
+                self.upload_status["queue_size"] = len(self.upload_queue)
+                self.upload_status["active"] = len(self.upload_queue) > 0
+                
+                # S3 업로드 시 별도의 LED 동작 없음
+                
                 self._process_upload_batch()
                 time.sleep(config.UPLOAD_INTERVAL)
         
@@ -654,6 +1194,15 @@ class DoorBoxInferenceSystem:
     def _process_upload_batch(self):
         """배치 업로드 처리"""
         if not self.upload_queue:
+            # 업로드가 완료되면 현재 상태에 맞는 LED 색상으로 복귀
+            self.upload_status["active"] = False
+            self.upload_status["queue_size"] = 0
+            
+            if not self.upload_status["active"] and self.rgb_available:
+                if self.system_state == "STANDBY":
+                    self.rgb.set_color_by_name("red")
+                elif self.system_state == "PIR_DETECTED" or self.system_state == "INFERENCE_ACTIVE":
+                    self.rgb.set_color_by_name("white")
             return
         
         items_to_process = [item for item in self.upload_queue[:config.UPLOAD_BATCH_SIZE] 
@@ -745,82 +1294,103 @@ class DoorBoxInferenceSystem:
         
         return new_x, new_y, new_w, new_h
     
-    def _save_detection_results(self, frame, classification_results, capture_timestamp, timestamp_str):
-        """감지 결과 저장 및 S3 큐 추가"""
+    def _save_detection_results_direct(self, frame, face_crop, classification_results, capture_timestamp, timestamp_str):
+        """직접 저장 방식"""
         try:
+            # 파일명 생성
             frame_filename = f"{timestamp_str}_frame.jpg"
             video_filename = f"{timestamp_str}_clip.mp4"
             result_filename = f"{timestamp_str}_result.json"
             
+            # 저장 경로 생성 (절대경로 사용)
             frame_path = os.path.join(config.LOCAL_FRAMES_DIR, frame_filename)
             video_path = os.path.join(config.LOCAL_VIDEOS_DIR, video_filename)
             result_path = os.path.join(config.LOCAL_RESULTS_DIR, result_filename)
             
-            # ★ 파일 중복 체크 (추가 안전장치)
-            if os.path.exists(frame_path):
-                self.logger.warning(f"파일이 이미 존재함: {frame_filename} - 덮어쓰기")
+            # 디렉토리 생성 확인
+            os.makedirs(config.LOCAL_FRAMES_DIR, exist_ok=True)
+            os.makedirs(config.LOCAL_VIDEOS_DIR, exist_ok=True)
+            os.makedirs(config.LOCAL_RESULTS_DIR, exist_ok=True)
             
-            # 1. 프레임 저장
-            cv2.imwrite(frame_path, frame)
-            self.logger.info(f"프레임 저장: {frame_filename}")
-            
-            # 2. 5초 클립 저장
-            detection_time = time.time()
-            clip_saved = self._save_video_clip(detection_time, video_path)
-            
-            if clip_saved:
-                self.logger.info(f"비디오 저장: {video_filename}")
+            # 1. 프레임 저장 (직접 저장)
+            success_frame = cv2.imwrite(frame_path, frame)
+            if success_frame and os.path.exists(frame_path):
+                file_size = os.path.getsize(frame_path)
+                self.logger.info(f"프레임 저장 성공: {frame_filename} ({file_size} bytes)")
             else:
-                self.logger.warning("비디오 저장 실패")
+                self.logger.error(f"프레임 저장 실패: {frame_filename}")
+                return False
+            
+            # 2. 얼굴 크롭 이미지도 별도 저장
+            face_filename = f"{timestamp_str}_face.jpg"
+            face_path = os.path.join(config.LOCAL_FRAMES_DIR, face_filename)
+            cv2.imwrite(face_path, face_crop)
+            
+            # 3. 비디오 클립 저장 (현재 시점 기준)
+            detection_time = time.time()
+            clip_saved = self._save_video_clip_improved(detection_time, video_path)
+            
+            if clip_saved and os.path.exists(video_path):
+                file_size = os.path.getsize(video_path)
+                self.logger.info(f"비디오 저장 성공: {video_filename} ({file_size} bytes)")
+            else:
+                self.logger.warning(f"비디오 저장 실패: {video_filename}")
                 video_path = None
             
-            # 3. JSON 데이터 생성 - timestamp_str에 맞춰 S3 경로도 조정
+            # 4. JSON 결과 데이터 생성
             s3_paths = self._generate_s3_paths_with_custom_filename(capture_timestamp, timestamp_str)
             result_data = {
                 "day": capture_timestamp.strftime("%Y%m%d"),
                 "time": capture_timestamp.strftime("%H:%M:%S"),
+                "timestamp": timestamp_str,
                 "image_key": s3_paths['image_key_full_path'],
                 "detection_results": {
-                    "accessory": classification_results.get("accessory"),
                     "emotion": classification_results.get("emotion"),
+                    "emotion_confidence": classification_results.get("emotion_confidence", 0.0),
                     "gender": classification_results.get("gender"),
-                    "age_group": classification_results.get("age_group")
-                }
+                    "gender_confidence": classification_results.get("gender_confidence", 0.0),
+                    "age_group": classification_results.get("age_group"),
+                    "age_confidence": classification_results.get("age_confidence", 0.0)
+                },
+                "image_files": {
+                    "original": frame_filename,
+                    "face_crop": face_filename,
+                    "video_clip": video_filename if clip_saved else None
+                },
+                "frame_size": {"width": frame.shape[1], "height": frame.shape[0]},
+                "face_crop_size": {"width": face_crop.shape[1], "height": face_crop.shape[0]}
             }
             
-            # 4. 로컬에 JSON 파일 저장
-            with open(result_path, 'w', encoding='utf-8') as f:
-                json.dump(result_data, f, ensure_ascii=False, indent=2)
-            self.logger.info(f"결과 JSON 저장: {result_filename}")
+            # 5. JSON 파일 저장
+            try:
+                with open(result_path, 'w', encoding='utf-8') as f:
+                    json.dump(result_data, f, ensure_ascii=False, indent=2)
+                
+                if os.path.exists(result_path):
+                    file_size = os.path.getsize(result_path)
+                    self.logger.info(f"결과 JSON 저장 성공: {result_filename} ({file_size} bytes)")
+                else:
+                    self.logger.error(f"JSON 저장 실패: {result_filename}")
+            except Exception as e:
+                self.logger.error(f"JSON 저장 오류: {e}")
             
-            # 5. S3 업로드 큐에 추가 - capture_timestamp 사용
+            # 6. S3 업로드 큐에 추가
             self._queue_upload_data(frame_path, video_path, result_data, capture_timestamp)
             
-            # 6. ★ 상세 로그 출력 (고유 파일명 및 대기 캡처 수 포함)
+            # 7. 상세 로그 출력
             emotion = classification_results.get("emotion", "unknown")
             emotion_conf = classification_results.get("emotion_confidence", 0.0)
-            accessory = classification_results.get("accessory")
             gender = classification_results.get("gender", "unknown")
             gender_conf = classification_results.get("gender_confidence", 0.0)
             age_group = classification_results.get("age_group", "unknown")
             age_conf = classification_results.get("age_confidence", 0.0)
             
-            # 악세서리 상태 텍스트 (confidence 없음)
-            if accessory is True:
-                accessory_text = "마스크 착용"
-            elif accessory is False:
-                accessory_text = "마스크 없음"
-            else:
-                accessory_text = "마스크 미판별"
-            
-            # ★ 개선된 로그 출력 (파일명 및 대기 상태 포함)
+            # 깔끔한 로그 출력
             self.logger.info("=" * 50)
-            self.logger.info(f"🖼️  프레임 파일: {frame_filename}")
-            self.logger.info(f"🕒 캡처 시간: {capture_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
-            self.logger.info(f"📊 대기 중인 캡처: {self.pending_captures}개")
-            self.logger.info("=== 분류 결과 상세 ===")
+            self.logger.info(f"프레임 파일: {frame_filename}")
+            self.logger.info(f"캡처 시간: {capture_timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+            self.logger.info("=== 분류 결과 ===")
             self.logger.info(f"   감정: {emotion} (신뢰도: {emotion_conf:.3f})")
-            self.logger.info(f"   악세서리: {accessory_text}")
             self.logger.info(f"   성별: {gender} (신뢰도: {gender_conf:.3f})")
             self.logger.info(f"   연령대: {age_group} (신뢰도: {age_conf:.3f})")
             self.logger.info("=" * 50)
@@ -881,10 +1451,11 @@ class DoorBoxInferenceSystem:
                 if self.ser.in_waiting > 0:
                     line = self.ser.readline().decode('utf-8').strip()
                     if line:
-                        # YOLO 감지 결과만 처리 (로그 출력 안함)
+                        # ★ PIR 기반 시스템에서는 시리얼 데이터 대신 프레임 기반 처리만 수행
+                        # YOLO 결과는 참고만 하고, 실제 처리는 PIR 트리거 기반으로 수행
                         if "[print_yolo_result]" in line and "[AI coordinate]" in line:
-                            self._process_yolo_detection(line)
-                        # 다른 시리얼 메시지는 무시
+                            # 로그만 출력하고 별도 처리 안함
+                            self.logger.debug(f"YOLO 결과 수신: {line}")
                 
                 time.sleep(0.001)  # 1ms 대기 (기존 0.1초에서 단축)
                 
@@ -896,105 +1467,21 @@ class DoorBoxInferenceSystem:
             self.ser.close()
         self.logger.info("시리얼 통신 종료")
     
-    def _process_yolo_detection(self, yolo_line):
-        """YOLO 감지 결과 처리"""
-        current_time = time.time()
-        
-        if not self.detection_active:
-            # 새로운 감지 세션 시작
-            self.detection_active = True
-            self.first_detection_time = current_time
-            self.detection_session_id = int(current_time)
-            self.last_capture_time = None
-            self.last_successful_capture_time = 0
-            self.pending_captures = 0
-            
-            # ★ 기존 타이머가 있으면 취소
-            if self.capture_timer:
-                self.capture_timer.cancel()
-                self.capture_timer = None
-            
-            self.logger.info(f"새로운 감지 세션 시작 (ID: {self.detection_session_id})")
-            
-            # 첫 감지 후 즉시 또는 지연 후 캡처 시작
-            if config.DETECTION_DELAY > 0:
-                self.capture_timer = threading.Timer(config.DETECTION_DELAY, self._start_periodic_capture)
-                self.capture_timer.start()
-                self.logger.info(f"{config.DETECTION_DELAY}초 후 캡처 시작 예정")
-            else:
-                self._start_periodic_capture()
-        
-        # 감지 세션 타임아웃 체크
-        if current_time - self.first_detection_time > config.DETECTION_TIMEOUT:
-            self._end_detection_session()
-    
-    def _start_periodic_capture(self):
-        """주기적 캡처 시작"""
-        if not self.detection_active:
+    def _process_inference_frame(self):
+        """PIR 감지 후 인퍼런스 프레임 처리 (초록색 박스 기반 캡처 타이밍 개선)"""
+        if self.system_state != "INFERENCE_ACTIVE":
             return
         
-        # ★ 캐스케이딩 타이머 방지
-        if self.capture_timer:
-            self.capture_timer.cancel()
-            self.capture_timer = None
-        
-        self.logger.info("캡처 및 분류 시작")
-        
-        # ★ 스레드에서 캡처 실행 (메인 타이머 블로킹 방지)
-        capture_thread = threading.Thread(target=self._execute_capture_safely, daemon=True)
-        capture_thread.start()
-        
-        # 다음 캡처 스케줄링
-        if self.detection_active:
-            self.capture_timer = threading.Timer(config.CAPTURE_INTERVAL, self._start_periodic_capture)
-            self.capture_timer.start()
-    
-    def _execute_capture_safely(self):
-        """안전한 캡처 실행"""
-        with self.capture_lock:
-            if self.capture_in_progress:
-                self.logger.debug("이미 캡처가 진행 중 - 건너뜀")
-                return
-            
-            current_time = time.time()
-            
-            # ★ 최소 간격 체크 (중복 캡처 방지)
-            min_interval = getattr(config, 'MIN_CAPTURE_INTERVAL', 3.0)
-            if current_time - self.last_successful_capture_time < min_interval:
-                self.logger.debug(f"최소 간격({min_interval}초) 미달 - 건너뜀")
-                return
-            
-            self.capture_in_progress = True
-            self.pending_captures += 1
-        
-        try:
-            # 실제 캡처 및 처리 실행
-            success = self._capture_and_process()
-            if success:
-                self.last_successful_capture_time = time.time()
-        except Exception as e:
-            self.logger.error(f"캡처 실행 중 오류: {e}")
-        finally:
-            with self.capture_lock:
-                self.capture_in_progress = False
-                self.pending_captures = max(0, self.pending_captures - 1)
-    
-    def _capture_and_process(self):
-        """캡처 및 처리 실행"""
         current_time = time.time()
-        
-        # 감지 세션이 활성화되어 있는지 확인
-        if not self.detection_active:
-            return
         
         # 세션 타임아웃 체크
-        if current_time - self.first_detection_time > config.DETECTION_TIMEOUT:
-            self._end_detection_session()
+        if current_time - self.pir_detection_time > config.DETECTION_TIMEOUT:
+            self._return_to_standby()
             return
         
-        # ★ 캡처 시점의 정확한 타임스탬프 생성 (로그와 파일명 동기화)
+        # 캡처 시점의 정확한 타임스탬프 생성
         seoul_tz = pytz.timezone('Asia/Seoul')
-        capture_timestamp = datetime.now(seoul_tz)  # 캡처 시점의 정확한 시간
+        capture_timestamp = datetime.now(seoul_tz)
         
         with self.frame_lock:
             if self.latest_frame is None:
@@ -1006,8 +1493,46 @@ class DoorBoxInferenceSystem:
         boxes = self._detect_green_boxes(current_frame)
         
         if not boxes:
-            self.logger.info("초록색 박스 없음 - 캡처 건너뜀")
+            # 초록색 박스가 없으면 상태 초기화
+            if self.green_box_detected:
+                self.green_box_detected = False
+                self.first_green_box_time = None
+                self.logger.debug("초록색 박스 사라짐 - 상태 초기화")
             return
+        
+        # 초록색 박스 감지됨
+        if not self.green_box_detected:
+            # 첫 번째 초록색 박스 감지
+            self.green_box_detected = True
+            self.first_green_box_time = current_time
+            self.logger.info("초록색 박스 첫 감지 - 2초 후 캡처 시작 예정")
+            
+            # RGB LED 보라색으로 점멸
+            if self.rgb_available:
+                self.rgb.blink_purple(times=3, interval=0.3)
+                self.rgb.set_color_by_name("white")
+            
+            return
+        
+        # 초록색 박스가 지속적으로 감지되는 상태에서 캡처 타이밍 결정
+        time_since_first_detection = current_time - self.first_green_box_time
+        
+        should_capture = False
+        
+        if self.last_capture_time == 0:
+            # 첫 번째 캡처: 첫 감지 후 2초 지연
+            if time_since_first_detection >= self.capture_delay:
+                should_capture = True
+        else:
+            # 후속 캡처: 마지막 캡처로부터 5초 간격
+            if current_time - self.last_capture_time >= self.capture_interval:
+                should_capture = True
+        
+        if not should_capture:
+            return
+        
+        # 캡처 및 분류 실행
+        self.logger.info("초록색 박스 지속 감지 - 얼굴 분류 실행")
         
         # 가장 큰 박스 선택
         largest_box = max(boxes, key=lambda box: box[2] * box[3])
@@ -1021,18 +1546,19 @@ class DoorBoxInferenceSystem:
         
         if face_crop.size == 0:
             self.logger.warning("크롭된 얼굴 영역이 비어있음")
-            return False
+            return
         
-        # ★ 고유 파일명 생성 (중복 방지)
+        # 고유 파일명 생성 (중복 방지)
         base_timestamp_str = capture_timestamp.strftime("%Y%m%d_%H%M%S")
         unique_timestamp_str = self._generate_unique_filename(base_timestamp_str)
         
         # 모든 모델로 분류 실행
         classification_results = self._classify_all_models(face_crop)
         
-        # ★ 결과 저장 (고유 파일명 사용)
-        success = self._save_detection_results(
+        # 결과 저장 (직접 저장 방식 사용)
+        success = self._save_detection_results_direct(
             current_frame, 
+            face_crop,
             classification_results, 
             capture_timestamp, 
             unique_timestamp_str
@@ -1040,52 +1566,21 @@ class DoorBoxInferenceSystem:
         
         if success:
             self.last_capture_time = current_time
-            return True
-        
-        return False
+            # OLED 표시용 결과 저장 및 표시 시작 시간 설정
+            self.face_detection_results = classification_results
+            self.classification_display_start = current_time
     
-    def _end_detection_session(self):
-        """감지 세션 종료"""
-        if self.detection_active:
-            self.logger.info(f"감지 세션 종료 (ID: {self.detection_session_id})")
-            
-            # ★ 활성 타이머 취소
-            if self.capture_timer:
-                self.capture_timer.cancel()
-                self.capture_timer = None
-            
-            self.detection_active = False
-            self.first_detection_time = None
-            self.last_capture_time = None
-            self.detection_session_id = None
-            self.last_successful_capture_time = 0
-            
-            # ★ 파일명 카운터 정리 (메모리 절약)
-            with self.filename_lock:
-                # 오래된 항목 정리 (1시간 이상 된 것들)
-                current_time = time.time()
-                keys_to_remove = []
-                for filename in self.filename_counter.keys():
-                    try:
-                        # 파일명에서 시간 추출 (YYYYMMDD_HHMMSS 형식)
-                        if '_' in filename:
-                            parts = filename.split('_')
-                            if len(parts) >= 2:
-                                date_part = parts[0]  # YYYYMMDD
-                                time_part = parts[1]  # HHMMSS
-                                datetime_str = date_part + time_part
-                                file_time = datetime.strptime(datetime_str, '%Y%m%d%H%M%S').timestamp()
-                                if current_time - file_time > 3600:  # 1시간
-                                    keys_to_remove.append(filename)
-                    except:
-                        # 파싱 실패한 오래된 키들도 제거
-                        keys_to_remove.append(filename)
-                
-                for key in keys_to_remove:
-                    del self.filename_counter[key]
-                
-                if keys_to_remove:
-                    self.logger.debug(f"파일명 카운터 정리: {len(keys_to_remove)}개 제거")
+    def _inference_loop_worker(self):
+        """인퍼런스 루프 스레드"""
+        while self.running:
+            if self.system_state == "INFERENCE_ACTIVE":
+                try:
+                    self._process_inference_frame()
+                    time.sleep(1.0)  # 1초 간격으로 프레임 처리
+                except Exception as e:
+                    self.logger.error(f"인퍼런스 처리 오류: {e}")
+            else:
+                time.sleep(0.1)  # 비활성 상태에서는 짧은 대기
     
     # ★ 추가 유틸리티 함수들
     def search_logs_by_filename(self, filename_pattern):
@@ -1137,6 +1632,19 @@ class DoorBoxInferenceSystem:
         """시스템 시작"""
         self.running = True
         
+        # 하드웨어 상태 표시
+        self.logger.info("=" * 60)
+        self.logger.info("🚪 DoorBox PIR 통합 시스템")
+        self.logger.info("=" * 60)
+        self.logger.info(f"💡 RGB LED: {'활성' if self.rgb_available else '비활성'}")
+        self.logger.info(f"📺 OLED Display: {'활성' if self.oled_available else '비활성'}")
+        self.logger.info(f"🚶 PIR Sensor: {'활성' if self.pir_available else '비활성'}")
+        self.logger.info(f"🔧 GPIO Method: {GPIO_METHOD}")
+        self.logger.info("=" * 60)
+        
+        # 시스템 초기 상태 설정
+        self._return_to_standby()
+        
         # 비디오 버퍼링 시작
         self._start_video_buffering()
         
@@ -1151,11 +1659,21 @@ class DoorBoxInferenceSystem:
         self.serial_thread = threading.Thread(target=self._serial_reader_worker, daemon=True)
         self.serial_thread.start()
         
-        self.logger.info("DoorBox 시스템 시작됨")
+        # PIR 모니터링 스레드 시작 (direct GPIO용)
+        self.pir_monitor_thread = threading.Thread(target=self._pir_monitor_worker, daemon=True)
+        self.pir_monitor_thread.start()
+        
+        # 인퍼런스 루프 스레드 시작
+        self.inference_thread = threading.Thread(target=self._inference_loop_worker, daemon=True)
+        self.inference_thread.start()
+        
+        self.logger.info("✅ DoorBox PIR 통합 시스템 시작됨")
         
         # 메인 루프
         try:
             while self.running:
+                # 주기적으로 OLED 업데이트
+                self._update_oled_display()
                 time.sleep(1)
         except KeyboardInterrupt:
             self.logger.info("키보드 인터럽트 감지")
@@ -1186,19 +1704,43 @@ class DoorBoxInferenceSystem:
             self.rtsp_thread.join(timeout=3)
         if self.serial_thread:
             self.serial_thread.join(timeout=3)
+        if self.pir_monitor_thread:
+            self.pir_monitor_thread.join(timeout=3)
+        if hasattr(self, 'inference_thread') and self.inference_thread:
+            self.inference_thread.join(timeout=3)
         
-        self.logger.info("✅ DoorBox 시스템 종료 완료")
+        # 하드웨어 정리
+        if self.rgb_available:
+            self.rgb.cleanup()
+        
+        if self.oled_available:
+            self.oled.clear()
+        
+        if self.pir_available:
+            self.pir.cleanup()
+        
+        self.logger.info("✅ DoorBox PIR 통합 시스템 종료 완료")
 
 def main():
     """메인 실행 함수"""
-    doorbox = DoorBoxInferenceSystem()
+    print("🚪 DoorBox PIR 통합 시스템")
+    print("하드웨어 연결:")
+    print("  RGB LED: R=Pin12, G=Pin16, B=Pin18, GND=Pin9")
+    print("  OLED: SDA=Pin3, SCL=Pin5, VCC=Pin1, GND=Pin6") 
+    print("  PIR: VCC=Pin4, OUT=Pin8, GND=Pin9")
+    print("  CatchCAM: USB + UART")
+    print()
+    
+    doorbox = None
     
     try:
+        doorbox = DoorBoxInferenceSystem()
         doorbox.start()
     except Exception as e:
         logging.error(f"시스템 오류: {e}")
     finally:
-        doorbox.stop()
+        if doorbox:
+            doorbox.stop()
 
 if __name__ == "__main__":
     main()
