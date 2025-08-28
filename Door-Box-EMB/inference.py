@@ -394,8 +394,8 @@ class DoorBoxInferenceSystem:
         # ★ PIR, OLED, RGB LED 초기화
         self._init_hardware_components()
         
-        # 모델들 로드 (ACC 제외)
-        self._load_models_except_accessory()
+        # 모델들 로드
+        self._load_models()
         
         # 비디오 레코더 초기화
         self._init_video_recorder()
@@ -629,18 +629,15 @@ class DoorBoxInferenceSystem:
         except Exception as e:
             self.logger.error(f"S3 버킷 연결 실패: {e}")
     
-    def _load_models_except_accessory(self):
-        """ACC 제외한 분류 모델들만 로드"""
+    def _load_models(self):
+        """3가지 분류 모델들 로드"""
         # 1. 감정 분류 모델 (EfficientNet-B0) - 320x320
         self.emotion_model = self._load_emotion_model()
         
-        # 2. 악세서리(마스크) 분류 모델 제외
-        self.accessory_model = None
-        
-        # 3. 연령대 분류 모델 (EfficientNet-B0) - 320x320
+        # 2. 연령대 분류 모델 (EfficientNet-B0) - 320x320
         self.age_model = self._load_efficientnet_model(config.AGE_MODEL_PATH, "연령대", num_classes=9)
         
-        # 4. 성별 분류 모델 (MobileNetV3-Small) - 320x320
+        # 3. 성별 분류 모델 (MobileNetV3-Small) - 320x320
         self.gender_model = self._load_mobilenet_model(config.GENDER_MODEL_PATH, "성별")
         
         # 공통 전처리 (320x320로 통일)
@@ -653,7 +650,7 @@ class DoorBoxInferenceSystem:
         ])
     
     def _load_emotion_model(self):
-        """감정 분류 모델 로드 (EfficientNet-B0)"""
+        """EfficientNet-B0 모델 로드 (감정 분류용)"""
         try:
             model = efficientnet_b0(pretrained=False)
             model.classifier = nn.Sequential(
@@ -669,82 +666,6 @@ class DoorBoxInferenceSystem:
             return model
         except Exception as e:
             self.logger.error(f"감정 모델 로드 실패: {e}")
-            return None
-    
-    def _load_ghostnet_model(self, model_path, model_name):
-        """GhostNet 모델 로드 (악세서리/마스크 분류용)"""
-        try:
-            if not os.path.exists(model_path):
-                self.logger.warning(f"{model_name} 모델 파일 없음: {model_path}")
-                return None
-            
-            # 체크포인트 먼저 로드해서 구조 확인
-            checkpoint = torch.load(model_path, map_location='cpu')
-            
-            # state_dict 추출
-            if 'model_state_dict' in checkpoint:
-                state_dict = checkpoint['model_state_dict']
-            elif 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
-            else:
-                state_dict = checkpoint
-            
-            # classifier 크기 확인
-            classifier_weight_shape = None
-            for key in state_dict.keys():
-                if 'classifier.weight' in key:
-                    classifier_weight_shape = state_dict[key].shape
-                    break
-            
-            if classifier_weight_shape is not None:
-                num_classes, feature_dim = classifier_weight_shape
-                self.logger.info(f"{model_name} 모델 구조: {num_classes}클래스, {feature_dim}차원")
-                
-                # 커스텀 GhostNet 모델 생성 (feature_dim에 맞춰)
-                class CustomGhostNet(nn.Module):
-                    def __init__(self, num_classes=2, feature_dim=960):
-                        super().__init__()
-                        # GhostNet backbone (feature extractor only)
-                        self.backbone = timm.create_model('ghostnet_100', pretrained=False, num_classes=0)
-                        
-                        # backbone 출력 차원 확인 및 조정
-                        backbone_dim = self.backbone.num_features
-                        
-                        # feature_dim에 맞춰 projection layer 추가
-                        if backbone_dim != feature_dim:
-                            self.projection = nn.Linear(backbone_dim, feature_dim)
-                        else:
-                            self.projection = nn.Identity()
-                        
-                        # classifier
-                        self.classifier = nn.Linear(feature_dim, num_classes)
-                    
-                    def forward(self, x):
-                        features = self.backbone(x)
-                        features = self.projection(features)
-                        return self.classifier(features)
-                
-                model = CustomGhostNet(num_classes, feature_dim)
-                
-            else:
-                # 기본 모델 생성
-                model = timm.create_model('ghostnet_100', pretrained=False, num_classes=2)
-            
-            # 모델에 로드 (strict=False로 호환성 확보)
-            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-            
-            if missing_keys:
-                self.logger.warning(f"누락된 키: {len(missing_keys)}개")
-            if unexpected_keys:
-                self.logger.warning(f"예상치 못한 키: {len(unexpected_keys)}개")
-            
-            model.eval()
-            
-            self.logger.info(f"✅ {model_name} 모델 로드 완료 (Custom GhostNet)")
-            return model
-            
-        except Exception as e:
-            self.logger.error(f"{model_name} 모델 로드 실패: {e}")
             return None
     
     def _load_efficientnet_model(self, model_path, model_name, num_classes=9):
@@ -822,7 +743,7 @@ class DoorBoxInferenceSystem:
             return None
     
     def _classify_all_models(self, face_crop):
-        """모든 모델로 분류 실행 (ACC 분류 제외)"""
+        """모든 모델로 분류 실행"""
         results = {
             "emotion": None,
             "emotion_confidence": 0.0,
@@ -833,8 +754,6 @@ class DoorBoxInferenceSystem:
         }
         
         try:
-            # ACC(악세서리) 분류 제외됨
-            
             # 1. 감정 분류 (alert/non-alert로 변경)
             if self.emotion_model is not None:
                 emotion, emotion_conf = self._classify_emotion(face_crop)
@@ -871,7 +790,7 @@ class DoorBoxInferenceSystem:
                 probabilities = torch.softmax(outputs, dim=1)
                 confidence, predicted = torch.max(probabilities, 1)
                 
-                emotion_classes = ["alert", "non-alert"]  # negative → alert, non-negative → non-alert
+                emotion_classes = ["alert", "non-alert"]
                 emotion = emotion_classes[predicted.item()]
                 conf = confidence.item()
                 
@@ -879,48 +798,7 @@ class DoorBoxInferenceSystem:
         except Exception as e:
             self.logger.error(f"감정 분류 오류: {e}")
             return "unknown", 0.0
-    
-    def _classify_accessory(self, face_crop):
-        """악세서리(마스크) 분류 - confidence 제외"""
-        if self.accessory_model is None:
-            return None
-        
-        try:
-            input_tensor = self.common_transform(face_crop).unsqueeze(0)
-            
-            with torch.no_grad():
-                # backbone으로 feature 추출
-                if hasattr(self.accessory_model, 'backbone'):
-                    features = self.accessory_model.backbone(input_tensor)
-                    
-                    # 차원 맞춤: 1280 → 960
-                    if features.shape[1] == 1280:
-                        # 간단한 차원 축소 (첫 960개 차원만 사용)
-                        features = features[:, :960]
-                    
-                    # classifier 적용
-                    outputs = self.accessory_model.classifier(features)
-                else:
-                    # 일반적인 forward
-                    outputs = self.accessory_model(input_tensor)
-                
-                probabilities = torch.softmax(outputs, dim=1)
-                confidence, predicted = torch.max(probabilities, 1)
-                
-                # 0: 마스크 없음, 1: 마스크 있음
-                has_mask = bool(predicted.item())
-                conf = confidence.item()
-                
-                # 임계값 적용 (신뢰도가 0.7 이상일 때만 마스크 착용으로 판단)
-                if conf < 0.7:
-                    has_mask = False
-                
-                return has_mask  # confidence 제외하고 boolean만 반환
-        except Exception as e:
-            self.logger.error(f"악세서리 분류 오류: {e}")
-            # 에러 발생시 기본값 반환
-            return False
-    
+
     def _classify_gender(self, face_crop):
         """성별 분류 (0=male, 1=female)"""
         if self.gender_model is None:
@@ -1175,7 +1053,7 @@ class DoorBoxInferenceSystem:
             seoul_tz = pytz.timezone('Asia/Seoul')
             dt = timestamp.astimezone(seoul_tz)
         
-        # ★ custom_filename 사용
+        # custom_filename 사용
         folder_name = f"{custom_filename}_log"
         
         base_path = f"home-1/cam-1/{dt.year:04d}/{dt.month:02d}/{dt.day:02d}/{folder_name}"
@@ -1211,10 +1089,6 @@ class DoorBoxInferenceSystem:
         for item in items_to_process:
             try:
                 s3_paths = self._generate_s3_paths(item['timestamp'])
-                
-                # JSON에 이미 image_key가 설정되어 있음
-                # 별도로 설정할 필요 없음
-                
                 # 1. JSON 업로드
                 if self._upload_json_to_s3(item['result_data'], s3_paths['result_key']):
                     self.logger.info(f"✅ JSON: {s3_paths['result_key']}")
@@ -1440,7 +1314,7 @@ class DoorBoxInferenceSystem:
                 if self.ser.in_waiting > 0:
                     line = self.ser.readline().decode('utf-8').strip()
                     if line:
-                        # ★ PIR 기반 시스템에서는 시리얼 데이터 대신 프레임 기반 처리만 수행
+                        # PIR 기반 시스템에서는 시리얼 데이터 대신 프레임 기반 처리만 수행
                         # YOLO 결과는 참고만 하고, 실제 처리는 PIR 트리거 기반으로 수행
                         if "[print_yolo_result]" in line and "[AI coordinate]" in line:
                             # 로그만 출력하고 별도 처리 안함
@@ -1571,7 +1445,7 @@ class DoorBoxInferenceSystem:
             else:
                 time.sleep(0.1)  # 비활성 상태에서는 짧은 대기
     
-    # ★ 추가 유틸리티 함수들
+    # 추가 유틸리티 함수들
     def search_logs_by_filename(self, filename_pattern):
         """파일명 패턴으로 로그 검색 (디버깅용)"""
         log_file = config.LOG_FILE
