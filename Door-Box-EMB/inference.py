@@ -1342,23 +1342,12 @@ class DoorBoxInferenceSystem:
             result_data = {
                 "day": capture_timestamp.strftime("%Y%m%d"),
                 "time": capture_timestamp.strftime("%H:%M:%S"),
-                "timestamp": timestamp_str,
                 "image_key": s3_paths['image_key_full_path'],
                 "detection_results": {
                     "emotion": classification_results.get("emotion"),
-                    "emotion_confidence": classification_results.get("emotion_confidence", 0.0),
                     "gender": classification_results.get("gender"),
-                    "gender_confidence": classification_results.get("gender_confidence", 0.0),
                     "age_group": classification_results.get("age_group"),
-                    "age_confidence": classification_results.get("age_confidence", 0.0)
-                },
-                "image_files": {
-                    "original": frame_filename,
-                    "face_crop": face_filename,
-                    "video_clip": video_filename if clip_saved else None
-                },
-                "frame_size": {"width": frame.shape[1], "height": frame.shape[0]},
-                "face_crop_size": {"width": face_crop.shape[1], "height": face_crop.shape[0]}
+                }
             }
             
             # 5. JSON 파일 저장
